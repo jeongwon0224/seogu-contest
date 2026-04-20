@@ -378,6 +378,34 @@
       border-radius: 100px;
     }
 
+    /* 인기투표 작품 그리드 */
+    .vote-entry-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: 16px;
+    }
+    .vote-entry-card {
+      position: relative;
+      transition: var(--transition);
+    }
+    .vote-entry-card.selected {
+      border-color: var(--color-primary) !important;
+      background: rgba(30,58,95,0.04) !important;
+      box-shadow: 0 0 0 3px rgba(30,58,95,0.15);
+    }
+    .vote-entry-check {
+      display: none;
+      margin-top: 14px;
+      text-align: center;
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--color-primary);
+      padding: 6px;
+      background: rgba(30,58,95,0.07);
+      border-radius: var(--radius-sm);
+    }
+    .vote-entry-card.selected .vote-entry-check { display: block; }
+
     .match-wrap {
       display: grid;
       grid-template-columns: 1fr auto 1fr;
@@ -983,7 +1011,7 @@
         <div class="form-group">
           <label class="form-label">관리자 비밀번호</label>
           <input type="password" class="form-input" id="admin-password-input" placeholder="비밀번호를 입력하세요" />
-          <div class="form-hint">초기 비밀번호는 <code>admin1234</code> 입니다. (파일에서 변경 가능)</div>
+          <div class="form-hint">관리자에게 문의하세요.</div>
         </div>
       </div>
       <div class="modal-footer">
@@ -1219,67 +1247,79 @@
     }
 
     // Record and check votes (also on Firestore for server-side dedup)
-    async function hasVoted(categoryId, matchId) {
-      const key = `voted:${categoryId}:${matchId}`;
+    // ★ 인기투표 방식: 라운드 단위로 1인 1표 추적
+    function hasVotedRound(categoryId, roundIndex) {
+      const key = `voted:${categoryId}:round:${roundIndex}`;
       return !!localStorage.getItem(key);
     }
 
-    function markVoted(categoryId, matchId, choice) {
-      const key = `voted:${categoryId}:${matchId}`;
-      localStorage.setItem(key, choice);
+    function markVotedRound(categoryId, roundIndex, entryId) {
+      const key = `voted:${categoryId}:round:${roundIndex}`;
+      localStorage.setItem(key, entryId);
     }
 
-    async function castVote(categoryId, matchId, choice) {
-      // choice is 'e1' or 'e2'
-      if (await hasVoted(categoryId, matchId)) {
-        throw new Error("이미 투표하셨습니다.");
-      }
-      const cat = await loadCategory(categoryId);
-      // ★ rounds[x]는 이제 { matches: [...] } 형태
-      const roundObj = cat.rounds[cat.currentRound];
-      if (!roundObj) throw new Error("경기를 찾을 수 없습니다.");
-      const round = roundObj.matches || [];
-      const match = round.find(m => m.id === matchId);
-      if (!match) throw new Error("경기를 찾을 수 없습니다.");
-      if (match.winner) throw new Error("이미 종료된 경기입니다.");
-      if (choice === "e1") match.v1 = (match.v1 || 0) + 1;
-      else match.v2 = (match.v2 || 0) + 1;
+    // 하위 호환 — 구버전 match 기반 키도 확인
+    async function hasVoted(categoryId, roundIndex) {
+      return hasVotedRound(categoryId, roundIndex);
+    }
 
-      // ★ 자동 라운드 진행: 라운드의 모든 경기에 MIN_VOTES_TO_ADVANCE 표 이상 쌓이면 다음 라운드로 진행
-      // 부전승(bye)이나 이미 승자가 결정된 경기는 자동 통과 처리
-      const allReachedThreshold = round.every(m =>
-        m.winner || m.bye || (m.v1 || 0) + (m.v2 || 0) >= MIN_VOTES_TO_ADVANCE
-      );
-      if (allReachedThreshold) {
+    async function castVote(categoryId, entryId) {
+      const cat = await loadCategory(categoryId);
+      const roundIndex = cat.currentRound;
+      if (hasVotedRound(categoryId, roundIndex)) {
+        throw new Error("이미 이번 라운드에 투표하셨습니다.");
+      }
+      const round = cat.rounds[roundIndex];
+      if (!round || round.completed) throw new Error("투표가 종료된 라운드입니다.");
+      const entries = round.entries || [];
+      if (!entries.includes(entryId)) throw new Error("유효하지 않은 작품입니다.");
+
+      // 득표 기록
+      round.votes = round.votes || {};
+      round.votes[entryId] = (round.votes[entryId] || 0) + 1;
+      round.voterCount = (round.voterCount || 0) + 1;
+
+      // ★ 40명 완료 시 자동 다음 라운드 진행
+      if (round.voterCount >= MIN_VOTES_TO_ADVANCE) {
         autoAdvanceRound(cat);
       }
 
       await saveCategory(cat);
-      markVoted(categoryId, matchId, choice);
+      markVotedRound(categoryId, roundIndex, entryId);
     }
 
     function autoAdvanceRound(cat) {
-      // Determine winners of current round, generate next round
-      // ★ rounds[x]는 이제 { matches: [...] } 형태의 객체
-      const roundObj = cat.rounds[cat.currentRound];
-      const round = roundObj ? (roundObj.matches || []) : [];
-      for (const m of round) {
-        if (m.winner) continue;
-        if (!m.e2) { m.winner = m.e1; continue; }
-        if ((m.v1 || 0) > (m.v2 || 0)) m.winner = m.e1;
-        else if ((m.v2 || 0) > (m.v1 || 0)) m.winner = m.e2;
-        else m.winner = Math.random() < 0.5 ? m.e1 : m.e2; // tie → random
-      }
-      let winners = round.map(m => m.winner);
-      if (cat.currentRound === 0 && cat.byeEntries && cat.byeEntries.length) {
-        winners = winners.concat(cat.byeEntries);
-        cat.byeEntries = [];
-      }
-      if (winners.length === 1) {
-        cat.status = 'completed'; // results still hidden until resultsPublished
+      const round = cat.rounds[cat.currentRound];
+      if (!round) return;
+      round.completed = true;
+
+      const entries = round.entries || [];
+      const votes = round.votes || {};
+
+      // 득표 순으로 정렬 (동점 시 무작위)
+      const sorted = [...entries].sort((a, b) => {
+        const diff = (votes[b] || 0) - (votes[a] || 0);
+        return diff !== 0 ? diff : (Math.random() < 0.5 ? 1 : -1);
+      });
+
+      // 상위 절반 진출 (최소 2개, 단 최종 2개→1개 우승)
+      const keepCount = entries.length <= 2 ? 1 : Math.max(2, Math.ceil(entries.length / 2));
+      const advancing = sorted.slice(0, keepCount);
+      round.winners = advancing;
+
+      if (advancing.length <= 1) {
+        // 우승자 결정 — 결과는 resultsPublished로 공개
+        cat.status = 'completed';
       } else {
-        // ★ generateNextRound은 이제 { matches: [...] } 반환
-        const nextRound = generateNextRound(winners);
+        // 다음 라운드 생성
+        const nextRound = {
+          entries: advancing,
+          votes: {},
+          voterCount: 0,
+          completed: false,
+          winners: [],
+          matches: []  // Firestore 구조 호환용
+        };
         cat.rounds.push(nextRound);
         cat.currentRound = cat.rounds.length - 1;
       }
@@ -1295,70 +1335,36 @@
       return a;
     }
 
+    // ★ 인기투표 방식: 모든 작품을 1개 라운드에 넣고 득표 순으로 진출
     function generateTournament(entries) {
-      // Random seeding, single elimination. Byes for odd counts at each level.
-      if (entries.length < 2) throw new Error("작품이 2개 이상 있어야 토너먼트를 시작할 수 있습니다.");
+      if (entries.length < 2) throw new Error("작품이 2개 이상 있어야 투표를 시작할 수 있습니다.");
       const shuffled = shuffle(entries);
-      // We only generate round 0; subsequent rounds are generated as winners are determined
-      const rounds = [];
-      const firstRound = [];
-      // Pair them; if odd, last one gets a bye (auto-advance)
-      const n = shuffled.length;
-      // Calculate next power of 2
-      const pow2 = Math.pow(2, Math.ceil(Math.log2(n)));
-      const byeCount = pow2 - n;
-      // First byeCount entries get byes (auto-advance to round 2)
-      const byeEntries = shuffled.slice(0, byeCount).map(e => e.id);
-      const matchEntries = shuffled.slice(byeCount);
-      for (let i = 0; i < matchEntries.length; i += 2) {
-        const e1 = matchEntries[i];
-        const e2 = matchEntries[i+1];
-        firstRound.push({
-          id: "m_" + Math.random().toString(36).slice(2, 9),
-          e1: e1.id,
-          e2: e2 ? e2.id : null,
-          v1: 0,
-          v2: 0,
-          winner: e2 ? null : e1.id,
-          bye: !e2
-        });
-      }
-      // ★ Firestore는 배열 안의 배열(중첩 배열)을 지원하지 않으므로
-      //   rounds를 { matches: [...] } 형태의 객체 배열로 저장합니다.
-      rounds.push({ matches: firstRound });
-      // Store byes for adding to round 2 later
-      return { rounds, byeEntries };
+      // 1라운드: 전체 작품 대상 인기투표
+      const firstRound = {
+        entries: shuffled.map(e => e.id),
+        votes: {},       // { entryId: 득표수 }
+        voterCount: 0,   // 투표 완료한 사람 수
+        completed: false,
+        winners: [],
+        matches: []      // Firestore 호환용 (사용 안 함)
+      };
+      return { rounds: [firstRound], byeEntries: [] };
     }
 
-    function generateNextRound(winners) {
-      const shuffled = shuffle(winners);
-      const next = [];
-      for (let i = 0; i < shuffled.length; i += 2) {
-        next.push({
-          id: "m_" + Math.random().toString(36).slice(2, 9),
-          e1: shuffled[i],
-          e2: shuffled[i+1] || null,
-          v1: 0,
-          v2: 0,
-          winner: shuffled[i+1] ? null : shuffled[i],
-          bye: !shuffled[i+1]
-        });
-      }
-      // ★ 객체 형태로 반환 (Firestore 중첩 배열 문제 방지)
-      return { matches: next };
-    }
-
-    function roundName(matches, totalRounds, currentIdx) {
-      const remaining = totalRounds - currentIdx;
-      const matchCount = matches.length;
-      const numEntries = matchCount * 2;
-      if (matchCount === 1) return "결승";
-      if (matchCount === 2) return "준결승";
-      return numEntries + "강";
+    // ★ 인기투표 방식 라운드 이름
+    function roundName(round, totalRounds, currentIdx) {
+      const entryCount = (round && round.entries) ? round.entries.length : 0;
+      if (entryCount <= 2) return "결승";
+      if (entryCount <= 4) return "준결승";
+      return currentIdx === 0 ? "예선" : `${currentIdx + 1}라운드`;
     }
 
     function calcTotalRounds(entryCount) {
-      return Math.ceil(Math.log2(entryCount));
+      // 각 라운드마다 절반씩 탈락 → ceil(log2(n)) 라운드
+      if (entryCount <= 1) return 1;
+      let rounds = 0, n = entryCount;
+      while (n > 1) { n = Math.ceil(n / 2); rounds++; }
+      return rounds;
     }
 
     // ---- ROUTING -----------------------------------------------------
@@ -1553,11 +1559,10 @@
 
       let roundInfo = "-";
       if (c.status === 'active' && c.rounds?.length) {
-        // ★ rounds[x]는 이제 { matches: [...] } 형태
-        const roundObj = c.rounds[c.currentRound];
-        if (roundObj && roundObj.matches) {
+        const round = c.rounds[c.currentRound];
+        if (round) {
           const total = calcTotalRounds(entryCount);
-          roundInfo = roundName(roundObj.matches, total, c.currentRound);
+          roundInfo = roundName(round, total, c.currentRound);
         }
       } else if (c.resultsPublished) {
         roundInfo = "🏆";
@@ -1588,23 +1593,15 @@
     }
 
     // ---- VOTER VIEW (unified queue across all categories) ------------
+    // ★ 인기투표 방식: 분야별로 모든 작품을 보여주고 1개 선택
     async function renderVoterQueue(filterCatId = null) {
-      const cats = state.categories.filter(c => {
-        if (filterCatId) return c.id === filterCatId;
-        return true;
-      });
-
-      // Only active tournaments are votable
+      const cats = state.categories.filter(c => filterCatId ? c.id === filterCatId : true);
       const activeCats = cats.filter(c => c.status === 'active');
 
       if (activeCats.length === 0) {
-        // 모든 분야가 완료(completed)된 상태인지 확인
-        const allCompleted = cats.every(c => c.status === 'completed' || c.resultsPublished);
         const anyCompleted = cats.some(c => c.status === 'completed' || c.resultsPublished);
         const anyDraft = cats.some(c => c.status === 'draft');
-
         if (anyCompleted) {
-          // 투표가 모두 끝났거나 결과 발표 대기 중
           main.innerHTML = `
             <div class="state-card mt-24" style="padding:60px 32px;">
               <span class="emoji">🙏</span>
@@ -1613,44 +1610,27 @@
                 28일 오후 2시 투표 결과가 공개됩니다.<br/>
                 <strong>감사합니다.</strong>
               </p>
-            </div>
-          `;
+            </div>`;
         } else {
           main.innerHTML = `
             <a class="back-link" id="back-home">◀ 처음으로</a>
             <div class="state-card mt-24">
               <span class="emoji">⏳</span>
               <h3>아직 투표가 시작되지 않았습니다</h3>
-              <p>${anyDraft ? '관리자가 토너먼트를 시작하면 이곳에서 투표하실 수 있습니다.' : '진행 중인 투표가 없습니다.'}</p>
+              <p>${anyDraft ? '관리자가 투표를 시작하면 이곳에서 참여하실 수 있습니다.' : '진행 중인 투표가 없습니다.'}</p>
               <button class="btn btn-secondary" id="home-btn">처음으로</button>
-            </div>
-          `;
+            </div>`;
           document.getElementById("back-home")?.addEventListener("click", () => navigate(''));
           document.getElementById("home-btn")?.addEventListener("click", () => navigate(''));
         }
         return;
       }
 
-      // Gather votable matches across all active categories
-      const queueItems = [];       // { cat, match, entries(map) }
-      let totalQueue = 0;
-      let votedQueue = 0;
-      for (const cat of activeCats) {
-        // ★ rounds[x]는 이제 { matches: [...] } 형태
-        const roundObj = cat.rounds[cat.currentRound];
-        const round = roundObj ? (roundObj.matches || []) : [];
-        const entries = new Map((cat.entries || []).map(e => [e.id, e]));
-        for (const m of round) {
-          if (m.bye || m.winner) continue;
-          if (!m.e2) continue;
-          totalQueue++;
-          const voted = await hasVoted(cat.id, m.id);
-          if (voted) { votedQueue++; continue; }
-          queueItems.push({ cat, match: m, entries });
-        }
-      }
+      // 이번 라운드에 아직 투표하지 않은 분야 찾기
+      const pendingCats = activeCats.filter(c => !hasVotedRound(c.id, c.currentRound));
 
-      if (queueItems.length === 0) {
+      if (pendingCats.length === 0) {
+        // 모든 활성 분야에 이미 투표 완료
         main.innerHTML = `
           <div class="state-card mt-24" style="padding:60px 32px;">
             <span class="emoji">🙏</span>
@@ -1659,81 +1639,120 @@
               28일 오후 2시 투표 결과가 공개됩니다.<br/>
               <strong>감사합니다.</strong>
             </p>
-          </div>
-        `;
+          </div>`;
         return;
       }
 
-      // Show the first unvoted match
-      const { cat, match, entries } = queueItems[0];
-      const e1 = entries.get(match.e1);
-      const e2 = entries.get(match.e2);
-      // ★ rounds[x]는 이제 { matches: [...] } 형태
-      const curRoundObj = cat.rounds[cat.currentRound];
-      const curRoundMatches = curRoundObj ? (curRoundObj.matches || []) : [];
+      // 첫 번째 미투표 분야 표시
+      const cat = pendingCats[0];
+      const round = cat.rounds[cat.currentRound];
+      const entryIds = round ? (round.entries || []) : [];
+      const entryMap = new Map((cat.entries || []).map(e => [e.id, e]));
       const total = calcTotalRounds((cat.entries || []).length);
-      const rName = roundName(curRoundMatches, total, cat.currentRound);
-      const pct = totalQueue === 0 ? 100 : Math.round((votedQueue / totalQueue) * 100);
+      const rName = roundName(round, total, cat.currentRound);
+      const doneCount = activeCats.length - pendingCats.length;
+      const pct = activeCats.length === 0 ? 100 : Math.round((doneCount / activeCats.length) * 100);
 
       main.innerHTML = `
         <a class="back-link" id="back-home">◀ 처음으로</a>
         <div class="vote-header mt-24">
           <div>
-            <div style="font-size:13px; color: var(--color-text-light); margin-bottom:4px;">
+            <div style="font-size:13px; color:var(--color-text-light); margin-bottom:4px;">
               ${cat.icon} ${cat.name} · ${cat.source}
             </div>
             <div class="round-pill">🏆 ${rName}</div>
           </div>
-          <div style="font-size:13px; color: var(--color-text-muted); font-weight:500; text-align:right;">
-            전체 ${totalQueue}경기 중 ${votedQueue}경기 완료<br/>
-            <span style="color:var(--color-text-light); font-size:12px;">남은 경기 ${queueItems.length}개</span>
+          <div style="font-size:13px; color:var(--color-text-muted); font-weight:500; text-align:right;">
+            ${activeCats.length}개 분야 중 ${doneCount}개 완료<br/>
+            <span style="color:var(--color-text-light); font-size:12px;">남은 분야 ${pendingCats.length}개</span>
           </div>
         </div>
 
         <div class="progress-wrap">
-          <div class="progress-text">
-            <span>투표 진행률</span>
-            <span>${pct}%</span>
-          </div>
+          <div class="progress-text"><span>분야별 투표 진행률</span><span>${pct}%</span></div>
           <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
         </div>
 
-        <div class="match-wrap">
-          ${renderEntryCard(e1, cat.type, 'A')}
-          <div class="vs-divider"><div class="vs-circle">VS</div></div>
-          ${renderEntryCard(e2, cat.type, 'B')}
+        <div style="background:rgba(30,58,95,0.04); border:1px solid rgba(30,58,95,0.12); border-radius:var(--radius-sm); padding:12px 16px; margin-bottom:20px; font-size:13px; color:var(--color-text-muted);">
+          💡 아래 작품 중 <strong>가장 마음에 드는 작품 1개</strong>를 선택하여 투표해 주세요.
         </div>
 
-        <div class="vote-action">
-          <button class="btn btn-primary btn-lg" id="vote-e1">🗳️ A작품에 투표</button>
-          <button class="btn btn-accent btn-lg" id="vote-e2">🗳️ B작품에 투표</button>
+        <div class="vote-entry-grid" id="vote-entry-grid">
+          ${entryIds.map((id, idx) => {
+            const entry = entryMap.get(id);
+            if (!entry) return '';
+            return renderVoteEntryCard(entry, cat.type, idx + 1);
+          }).join('')}
+        </div>
+
+        <div class="vote-action" style="margin-top:28px;">
+          <button class="btn btn-primary btn-lg btn-block" id="vote-confirm-btn" disabled>
+            선택한 작품에 투표하기
+          </button>
         </div>
         <div class="text-center text-muted mt-16" style="font-size:13px;">
-          블라인드 투표입니다. 신중하게 선택해주세요. 한 경기에 한 번만 투표할 수 있습니다.<br/>
-          투표 후 다음 경기로 자동 이동합니다.
+          블라인드 투표입니다. 신중하게 선택해주세요.<br/>이 분야는 <strong>1회만 투표</strong>할 수 있습니다.
         </div>
       `;
 
       document.getElementById("back-home").onclick = () => navigate('');
-      document.getElementById("vote-e1").onclick = () => handleVoteQueue(cat.id, match.id, 'e1', filterCatId);
-      document.getElementById("vote-e2").onclick = () => handleVoteQueue(cat.id, match.id, 'e2', filterCatId);
+
+      // 작품 선택 처리
+      let selectedEntryId = null;
+      document.querySelectorAll(".vote-entry-card").forEach(card => {
+        card.onclick = () => {
+          document.querySelectorAll(".vote-entry-card").forEach(c => c.classList.remove("selected"));
+          card.classList.add("selected");
+          selectedEntryId = card.dataset.entryId;
+          const btn = document.getElementById("vote-confirm-btn");
+          if (btn) { btn.disabled = false; btn.textContent = "이 작품에 투표하기 ✓"; }
+        };
+      });
+
+      document.getElementById("vote-confirm-btn").onclick = async () => {
+        if (!selectedEntryId) return;
+        const btn = document.getElementById("vote-confirm-btn");
+        btn.disabled = true;
+        btn.textContent = "투표 중...";
+        try {
+          await castVote(cat.id, selectedEntryId);
+          toast(`${cat.name} (${cat.source}) 투표 완료! 감사합니다.`, "success");
+          setTimeout(() => renderVoterQueue(filterCatId), 200);
+        } catch (e) {
+          toast(e.message || "투표 중 오류가 발생했습니다.", "error");
+          btn.disabled = false;
+          btn.textContent = "이 작품에 투표하기 ✓";
+        }
+      };
     }
 
-    async function handleVoteQueue(categoryId, matchId, choice, filterCatId) {
-      const btn1 = document.getElementById("vote-e1");
-      const btn2 = document.getElementById("vote-e2");
-      if (btn1) btn1.disabled = true;
-      if (btn2) btn2.disabled = true;
-      try {
-        await castVote(categoryId, matchId, choice);
-        toast("투표가 완료되었습니다. 감사합니다!", "success");
-        // Re-render queue (subscription will also trigger, but this ensures immediate update)
-        setTimeout(() => renderVoterQueue(filterCatId), 100);
-      } catch (e) {
-        toast(e.message || "투표 중 오류가 발생했습니다.", "error");
-        if (btn1) btn1.disabled = false;
-        if (btn2) btn2.disabled = false;
+    // 투표용 작품 카드 (선택 UI 포함)
+    function renderVoteEntryCard(entry, type, num) {
+      let content = '';
+      if (type === 'poem') {
+        const lines = entry.lines || ['','','',''];
+        content = `<div class="entry-poem" style="gap:10px;">
+          ${lines.map((t,i) => `
+            <div class="line">
+              <span class="char">${POEM_CHARS[i]}</span>
+              <span class="text" style="font-size:15px;">${escapeHtml(t || '')}</span>
+            </div>`).join('')}
+        </div>`;
+      } else if (type === 'letter') {
+        content = `
+          ${entry.title ? `<div class="entry-letter-title" style="font-size:16px;">${escapeHtml(entry.title)}</div>` : ''}
+          <div class="entry-letter-body" style="max-height:200px;">${escapeHtml(entry.body || '')}</div>`;
+      } else {
+        content = `
+          ${entry.imageData ? `<img class="entry-photo" src="${entry.imageData}" alt="photo" />` : `<div class="entry-photo" style="display:grid;place-items:center;color:var(--color-text-light);">이미지 없음</div>`}
+          <div class="entry-photo-caption">${escapeHtml(entry.caption || '')}</div>`;
       }
+      return `
+        <div class="vote-entry-card entry-card" data-entry-id="${entry.id}" style="cursor:pointer;">
+          <span class="entry-label">작품 ${num}</span>
+          ${content}
+          <div class="vote-entry-check">✓ 선택</div>
+        </div>`;
     }
 
     function renderEntryCard(entry, type, label) {
@@ -1774,32 +1793,30 @@
     }
 
     function renderVoterCompleted(c) {
-      // Compute ranking: winner is last round's winner. For simplicity show winner + bracket summary
-      const entries = new Map(c.entries.map(e => [e.id, e]));
-      // ★ rounds[x]는 이제 { matches: [...] } 형태
-      const finalRoundObj = c.rounds[c.rounds.length - 1];
-      const finalMatch = finalRoundObj?.matches?.[0];
-      const winnerId = finalMatch?.winner;
-      const runnerUpId = finalMatch ? (winnerId === finalMatch.e1 ? finalMatch.e2 : finalMatch.e1) : null;
+      // ★ 인기투표 방식: 최종 라운드 득표 순으로 순위 산정
+      const entryMap = new Map(c.entries.map(e => [e.id, e]));
+      const finalRound = c.rounds[c.rounds.length - 1];
+      const finalEntries = finalRound ? (finalRound.entries || []) : [];
+      const finalVotes = finalRound ? (finalRound.votes || {}) : {};
+      const finalWinners = finalRound ? (finalRound.winners || []) : [];
 
-      // Semi-finalists: losers of round before final
-      const semiRoundObj = c.rounds[c.rounds.length - 2];
-      const semiRound = semiRoundObj?.matches || [];
-      const thirdPlaces = [];
-      if (semiRound.length > 0) {
-        for (const m of semiRound) {
-          if (m.winner && m.e1 && m.e2) {
-            const loserId = m.winner === m.e1 ? m.e2 : m.e1;
-            thirdPlaces.push(loserId);
-          }
-        }
-      }
+      // 우승자: winners[0] (autoAdvanceRound에서 설정)
+      const winnerId = finalWinners[0] || null;
+
+      // 준우승: 결승에서 진 작품 or 득표 2위
+      const sortedFinal = [...finalEntries].sort((a,b) => (finalVotes[b]||0)-(finalVotes[a]||0));
+      const runnerUpId = sortedFinal.find(id => id !== winnerId) || null;
+
+      // 3위: 결승 직전 라운드에서 탈락한 작품들
+      const semiRound = c.rounds.length >= 2 ? c.rounds[c.rounds.length - 2] : null;
+      const semiEntries = semiRound ? (semiRound.entries || []) : [];
+      const thirdPlaces = semiEntries.filter(id => !finalEntries.includes(id));
 
       main.innerHTML = `
         <a class="back-link" id="back-home">◀ 처음으로</a>
         <div class="vote-header mt-24">
           <div>
-            <div style="font-size:13px; color: var(--color-text-light); margin-bottom:4px;">${c.name} · ${c.source}</div>
+            <div style="font-size:13px; color:var(--color-text-light); margin-bottom:4px;">${c.name} · ${c.source}</div>
             <div class="round-pill">🎉 투표 종료</div>
           </div>
         </div>
@@ -1811,15 +1828,18 @@
         </div>
 
         <div class="finalists">
-          ${winnerId ? renderFinalistRow(1, entries.get(winnerId), c.type) : ''}
-          ${runnerUpId ? renderFinalistRow(2, entries.get(runnerUpId), c.type) : ''}
-          ${thirdPlaces.map(id => renderFinalistRow(3, entries.get(id), c.type)).join("")}
+          ${winnerId ? renderFinalistRow(1, entryMap.get(winnerId), c.type, finalVotes[winnerId]||0) : ''}
+          ${runnerUpId ? renderFinalistRow(2, entryMap.get(runnerUpId), c.type, finalVotes[runnerUpId]||0) : ''}
+          ${thirdPlaces.map(id => {
+            const sv = semiRound ? (semiRound.votes||{}) : {};
+            return renderFinalistRow(3, entryMap.get(id), c.type, sv[id]||0);
+          }).join("")}
         </div>
       `;
       document.getElementById("back-home").onclick = () => navigate('');
     }
 
-    function renderFinalistRow(rank, entry, type) {
+    function renderFinalistRow(rank, entry, type, voteCount) {
       if (!entry) return '';
       const rankClass = rank === 1 ? 'rank-1' : rank === 2 ? 'rank-2' : rank === 3 ? 'rank-3' : 'rank-other';
       const rankText = rank === 1 ? '우승' : rank === 2 ? '준우승' : '3위';
@@ -1831,10 +1851,11 @@
         <div class="finalist-row">
           <div class="finalist-rank ${rankClass}">${rankText}</div>
           <div style="min-width:0;">
-            <div style="font-weight:600; color:var(--color-text); margin-bottom:4px;">${escapeHtml((type === 'letter' ? (entry.title || '편지') : (type === 'poem' ? '어버이날 4행시' : '사진 작품')))}</div>
-            <div style="font-size:13px; color: var(--color-text-muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${escapeHtml(summary)}</div>
+            <div style="font-weight:600; color:var(--color-text); margin-bottom:4px;">${escapeHtml(type === 'letter' ? (entry.title || '편지') : type === 'poem' ? '어버이날 4행시' : '사진 작품')}</div>
+            <div style="font-size:13px; color:var(--color-text-muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${escapeHtml(summary)}</div>
+            ${voteCount > 0 ? `<div style="font-size:12px; color:var(--color-primary); margin-top:4px; font-weight:600;">${voteCount}표</div>` : ''}
           </div>
-          <button class="btn btn-secondary btn-sm" data-preview-entry="${entry.id}" data-preview-cat="${state.category.id}">자세히 보기</button>
+          <button class="btn btn-secondary btn-sm" data-preview-entry="${entry.id}" data-preview-cat="${(state.category||{}).id||''}">자세히 보기</button>
         </div>
       `;
     }
@@ -1922,29 +1943,25 @@
 
       const statusBlock = (() => {
         if (c.status === 'active') {
-          // ★ rounds[x]는 이제 { matches: [...] } 형태
-          const roundObj = c.rounds[c.currentRound];
-          const round = roundObj ? (roundObj.matches || []) : [];
-          // 이번 라운드 득표 현황 계산
-          const votableMatches = round.filter(m => !m.bye && !m.winner && m.e2);
-          const minVotes = votableMatches.length > 0
-            ? Math.min(...votableMatches.map(m => (m.v1 || 0) + (m.v2 || 0)))
-            : 0;
-          const pct = Math.min(100, Math.round((minVotes / MIN_VOTES_TO_ADVANCE) * 100));
+          const round = c.rounds[c.currentRound] || {};
+          const entryCount = (round.entries || []).length;
+          const voterCount = round.voterCount || 0;
+          const pct = Math.min(100, Math.round((voterCount / MIN_VOTES_TO_ADVANCE) * 100));
+          const rName = roundName(round, total, c.currentRound);
           return `
             <div class="bracket-info">
               <div>상태: <strong>진행 중</strong></div>
-              <div>현재 라운드: <strong>${roundName(round, total, c.currentRound)}</strong> (${c.currentRound + 1}/${total})</div>
-              <div>이번 라운드 경기: <strong>${round.length}개</strong></div>
+              <div>현재 라운드: <strong>${rName}</strong> (${c.currentRound + 1}/${total})</div>
+              <div>이번 라운드 참여 작품: <strong>${entryCount}개</strong></div>
               <div style="width:100%; margin-top:8px;">
                 <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom:4px;">
-                  <span>득표 현황 (경기당 최소 득표 기준)</span>
-                  <span><strong>${minVotes} / ${MIN_VOTES_TO_ADVANCE}표</strong></span>
+                  <span>투표 참여 현황</span>
+                  <span><strong>${voterCount} / ${MIN_VOTES_TO_ADVANCE}명</strong></span>
                 </div>
                 <div style="height:8px; background:var(--color-border); border-radius:100px; overflow:hidden;">
                   <div style="height:100%; width:${pct}%; background:linear-gradient(90deg,var(--color-primary),var(--color-accent)); border-radius:100px; transition:width 0.4s;"></div>
                 </div>
-                <div style="font-size:11px; color:var(--color-text-light); margin-top:4px;">${pct >= 100 ? '✅ 임계값 달성 — 자동 진행 예정' : `목표까지 ${MIN_VOTES_TO_ADVANCE - minVotes}표 남음 · 부족하면 강제 라운드 마감 버튼 사용`}</div>
+                <div style="font-size:11px; color:var(--color-text-light); margin-top:4px;">${pct >= 100 ? '✅ 목표 달성 — 자동으로 다음 라운드 진행됨' : `목표까지 ${MIN_VOTES_TO_ADVANCE - voterCount}명 남음 · 부족하면 강제 라운드 마감 버튼 사용`}</div>
               </div>
             </div>
           `;
@@ -1999,7 +2016,7 @@
               <h4>토너먼트 대진표</h4>
             </div>
             <div class="rounds-list">
-              ${c.rounds.map((roundObj, idx) => renderAdminRoundBlock(roundObj.matches || [], idx, c, total)).join("")}
+              ${c.rounds.map((roundObj, idx) => renderAdminRoundBlock(roundObj, idx, c, total)).join("")}
             </div>
           </div>
         ` : ''}
@@ -2057,42 +2074,55 @@
       `;
     }
 
+    // ★ 인기투표 방식 라운드 블록 (관리자용)
     function renderAdminRoundBlock(round, idx, cat, total) {
-      const entries = new Map(cat.entries.map(e => [e.id, e]));
+      const entryMap = new Map(cat.entries.map(e => [e.id, e]));
       const isCurrent = cat.status === 'active' && idx === cat.currentRound;
-      const allDecided = round.every(m => m.winner);
-      const stateClass = idx < cat.currentRound ? 'done' : (isCurrent ? 'active' : '');
-      const name = roundName(round, total, idx);
+      const stateClass = round.completed ? 'done' : (isCurrent ? 'active' : '');
+      const roundObj = { entries: round.entries || [], votes: round.votes || {} };
+      const name = roundName(roundObj, total, idx);
+      const voterCount = round.voterCount || 0;
+      const pct = Math.min(100, Math.round((voterCount / MIN_VOTES_TO_ADVANCE) * 100));
+
+      // 득표 순 정렬
+      const sorted = [...(round.entries||[])].sort((a,b)=>(round.votes?.[b]||0)-(round.votes?.[a]||0));
+
       return `
         <div>
           <div class="round-card ${stateClass}">
             <div class="round-info-block">
               <span class="name">${name} <span style="color:var(--color-text-light);font-weight:normal;font-size:12px;">(${idx+1}/${total})</span></span>
-              <span class="meta">${round.length}개 경기 · ${allDecided ? '완료' : (isCurrent ? '진행 중' : '대기')}</span>
+              <span class="meta">${(round.entries||[]).length}개 작품 · 투표 ${voterCount}명 · ${round.completed ? '완료' : (isCurrent ? '진행 중' : '대기')}</span>
             </div>
+            ${isCurrent ? `
+              <div style="width:180px;">
+                <div style="font-size:11px; color:var(--color-text-light); margin-bottom:3px; text-align:right;">${voterCount} / ${MIN_VOTES_TO_ADVANCE}명</div>
+                <div style="height:6px; background:var(--color-border); border-radius:100px; overflow:hidden;">
+                  <div style="height:100%; width:${pct}%; background:linear-gradient(90deg,var(--color-primary),var(--color-accent)); border-radius:100px;"></div>
+                </div>
+              </div>` : ''}
           </div>
           <div class="match-list">
-            ${round.map((m, mIdx) => {
-              const e1 = m.e1 ? entries.get(m.e1) : null;
-              const e2 = m.e2 ? entries.get(m.e2) : null;
-              const n1 = entryLabel(e1, cat.type);
-              const n2 = e2 ? entryLabel(e2, cat.type) : '(부전승)';
-              const w1 = m.winner === m.e1;
-              const w2 = m.winner === m.e2;
+            ${sorted.map((id, rank) => {
+              const entry = entryMap.get(id);
+              const label = entryLabel(entry, cat.type);
+              const votes = round.votes?.[id] || 0;
+              const isWinner = (round.winners||[]).includes(id);
+              const maxVotes = Math.max(1, ...sorted.map(i => round.votes?.[i]||0));
+              const barPct = Math.round((votes / maxVotes) * 100);
               return `
-                <div class="match-row">
-                  <div class="m-no">#${mIdx+1}</div>
-                  <div class="match-side ${w1 ? 'winner' : ''}">
-                    <span class="name">${escapeHtml(n1)}</span>
-                    <span class="vote-count">${m.v1 || 0}표</span>
+                <div class="match-row" style="grid-template-columns: 20px 1fr 50px; gap:10px; align-items:center;">
+                  <div class="m-no" style="font-size:12px; color:var(--color-text-light);">${rank+1}</div>
+                  <div>
+                    <div style="font-size:13px; font-weight:${isWinner?'700':'400'}; color:${isWinner?'var(--color-primary)':'var(--color-text)'}; margin-bottom:4px;">
+                      ${isWinner ? '✅ ' : ''}${escapeHtml(label)}
+                    </div>
+                    <div style="height:5px; background:var(--color-border); border-radius:100px; overflow:hidden;">
+                      <div style="height:100%; width:${barPct}%; background:${isWinner?'var(--color-primary)':'var(--color-border-strong)'}; border-radius:100px;"></div>
+                    </div>
                   </div>
-                  <div class="vs">VS</div>
-                  <div class="match-side ${w2 ? 'winner' : ''}">
-                    <span class="name">${escapeHtml(n2)}</span>
-                    ${e2 ? `<span class="vote-count">${m.v2 || 0}표</span>` : ''}
-                  </div>
-                </div>
-              `;
+                  <div style="font-size:13px; font-weight:600; color:var(--color-text); text-align:right;">${votes}표</div>
+                </div>`;
             }).join("")}
           </div>
         </div>
@@ -2456,15 +2486,11 @@
     // ---- FORCE ADVANCE ROUND (강제 라운드 마감) -------------------------
     async function handleForceAdvanceRound(cat) {
       if (cat.status !== 'active') return;
-      const roundObj = cat.rounds[cat.currentRound];
-      const round = roundObj ? (roundObj.matches || []) : [];
-      const votableMatches = round.filter(m => !m.bye && !m.winner && m.e2);
-      const minVotes = votableMatches.length > 0
-        ? Math.min(...votableMatches.map(m => (m.v1 || 0) + (m.v2 || 0)))
-        : 0;
+      const round = cat.rounds[cat.currentRound];
+      const voterCount = round ? (round.voterCount || 0) : 0;
       const ok = await confirmDialog(
         "강제 라운드 마감",
-        `현재 경기당 최소 득표 수는 ${minVotes}표입니다 (목표: ${MIN_VOTES_TO_ADVANCE}표).\n\n` +
+        `현재 투표 참여 인원은 ${voterCount}명입니다 (목표: ${MIN_VOTES_TO_ADVANCE}명).\n\n` +
         `아직 목표에 미달하더라도 현재 득표 수 기준으로 이번 라운드를 마감하고 다음 라운드로 진행합니다.\n\n(동점 시 무작위 선정) 계속하시겠습니까?`
       );
       if (!ok) return;
